@@ -34,3 +34,5 @@ typedef struct NetworkAddress {
     char salt[SALT_LEN];
     hashdata_t signature;
 } NetworkAddress_t;
+
+void get_signature(void* password, int password_len, char* salt, hashdata_t* out_hash);
