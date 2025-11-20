@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <time.h>
+#include <stdarg.h>
 
 #ifdef __APPLE__
 #include "./endian.h"
@@ -22,18 +23,64 @@ NetworkAddress_t *my_address;
 NetworkAddress_t **network = NULL;
 uint32_t peer_count = 0;
 
+pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+
+void ts_print(const char *fmt, ...) {
+    pthread_mutex_lock(&print_mutex);
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stdout, fmt, args);
+    va_end(args);
+
+    fflush(stdout);  // ensure ordered output
+
+    pthread_mutex_unlock(&print_mutex);
+}
+
+
+void free_network()
+{
+    pthread_mutex_lock(&network_mutex);
+    for (uint32_t i = 0; i < peer_count; i++)
+    {
+        free(network[i]);
+    }
+    free(network);
+    pthread_mutex_unlock(&network_mutex);
+}
+
+int error_helper(char *ip, int port)
+{
+    if (!is_valid_ip(ip))
+    {
+        fprintf(stderr, ">> Invalid peer IP: %s\n", ip);
+        return 0;
+    }
+    if (!is_valid_port(port))
+    {
+        fprintf(stderr, ">> Invalid peer port: %d\n", port);
+        return 0;
+    }
+
+    return 1;
+}
 
 // Adds candidate to network only if it's not already present.
 // Returns 1 if added, 0 if it already existed.
 int add_to_network_if_missing(const NetworkAddress_t *candidate)
 {
+    pthread_mutex_lock(&network_mutex);
+
     // Check for duplicates
     for (uint32_t i = 0; i < peer_count; i++)
     {
         if (strcmp(network[i]->ip, candidate->ip) == 0 &&
             network[i]->port == candidate->port)
         {
+            pthread_mutex_unlock(&network_mutex);
             return 0; // already present
         }
     }
@@ -42,6 +89,7 @@ int add_to_network_if_missing(const NetworkAddress_t *candidate)
     NetworkAddress_t *new_peer = malloc(sizeof(NetworkAddress_t));
     memcpy(new_peer, candidate, sizeof(NetworkAddress_t));
     network[peer_count++] = new_peer;
+    pthread_mutex_unlock(&network_mutex);
 
     return 1;
 }
@@ -54,7 +102,7 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
     int sock = compsys_helper_open_clientfd(peer->ip, port_str);
     if (sock < 0)
     {
-        printf("Could not connect to %s:%d\n", peer->ip, peer->port);
+        ts_print("Could not connect to %s:%d\n", peer->ip, peer->port);
         return;
     }
 
@@ -88,7 +136,7 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
 
         if (reply_status != STATUS_OK)
         {
-            printf("Register failed (status=%d)\n", reply_status);
+            ts_print("Register failed (status=%d)\n", reply_status);
             close(sock);
             return;
         }
@@ -114,18 +162,25 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
 
 void inform_all_other_peers(NetworkAddress_t *new_peer)
 {
-    for (uint32_t i = 0; i < peer_count; i++)
-    {
+    NetworkAddress_t *local_copy[128];
+    uint32_t local_count = 0;
+
+    pthread_mutex_lock(&network_mutex);
+    for (uint32_t i = 0; i < peer_count; i++) {
         NetworkAddress_t *p = network[i];
+        if (p != my_address &&
+            !(strcmp(p->ip, new_peer->ip) == 0 && p->port == new_peer->port))
+        {
+            local_copy[local_count++] = p;
+        }
+    }
+    pthread_mutex_unlock(&network_mutex);
 
-        if (p == my_address)
-            continue;
-        if (strcmp(p->ip, new_peer->ip) == 0 && p->port == new_peer->port)
-            continue;
-
-        send_message(p, COMMAND_INFORM, new_peer, sizeof(NetworkAddress_t));
+    for (uint32_t i = 0; i < local_count; i++) {
+        send_message(local_copy[i], COMMAND_INFORM, new_peer, sizeof(NetworkAddress_t));
     }
 }
+
 
 void *handle_server_request_thread(void *arg)
 {
@@ -133,15 +188,12 @@ void *handle_server_request_thread(void *arg)
     int connfd = *((int *)arg);
     free(arg);
 
-    compsys_helper_state_t rio;
-    compsys_helper_readinitb(&rio, connfd);
-
     // ===== 1. Read the RequestHeader_t =====
     RequestHeader_t req;
-    int bytes_read = compsys_helper_readnb(&rio, &req, sizeof(RequestHeader_t));
-    if (bytes_read <= 0)
+    int bytes_read = compsys_helper_readn(connfd, &req, sizeof(RequestHeader_t));
+    if (bytes_read != sizeof(RequestHeader_t))
     {
-        fprintf(stderr, ">> [Server] Failed to read request header\n");
+        fprintf(stderr, ">> [Server] Failed to read request header (got %d bytes)\n", bytes_read);
         close(connfd);
         return NULL;
     }
@@ -151,14 +203,23 @@ void *handle_server_request_thread(void *arg)
     uint32_t body_len = ntohl(req.length);
     uint32_t port = ntohl(req.port);
 
-    printf(">> [Server] Received command=%u length=%u from %s:%u\n",
+    ts_print(">> [Server] Received command=%u length=%u from %s:%u\n",
            command, body_len, req.ip, port);
 
     if (command == COMMAND_INFORM)
     {
         NetworkAddress_t new_peer;
         compsys_helper_readn(connfd, &new_peer, sizeof(NetworkAddress_t));
+
         add_to_network_if_missing(&new_peer);
+
+        ts_print("Server list is now:\n");
+        pthread_mutex_lock(&network_mutex);
+        for (uint32_t i = 0; i < peer_count; i++)
+        {
+            ts_print(" - %s:%d\n", network[i]->ip, network[i]->port);
+        }
+        pthread_mutex_unlock(&network_mutex);
         close(connfd);
         return NULL;
     }
@@ -168,9 +229,9 @@ void *handle_server_request_thread(void *arg)
     {
 
         // --- Validation ---
-        if (!is_valid_ip(req.ip) || !is_valid_port(port))
+        if (!error_helper(req.ip, port))
         {
-            printf(">> [Server] Invalid IP/port in register request.\n");
+            ts_print(">> [Server] Invalid IP/port in register request.\n");
             ReplyHeader_t reply = {
                 .length = htonl(0),
                 .status = htonl(STATUS_MALFORMED),
@@ -221,9 +282,6 @@ void *handle_server_request_thread(void *arg)
     return NULL;
 }
 
-
-
-
 void get_signature(void *password, int password_len, char *salt, hashdata_t *out_hash)
 {
     int combined_len = password_len + SALT_LEN;
@@ -239,8 +297,6 @@ void get_signature(void *password, int password_len, char *salt, hashdata_t *out
     memset(buf, 0, combined_len);
     free(buf);
 }
-
-
 
 /*
  * Function to act as thread for all required client interactions. This thread
@@ -281,10 +337,10 @@ void *client_thread()
     // Send REGISTER request
     send_message(&peer_address, COMMAND_REGISTER, NULL, 0);
     // Print network list after registration
-    printf("\nKnown peers after registration:\n");
+    ts_print("\nKnown peers after registration:\n");
     for (uint32_t i = 0; i < peer_count; i++)
     {
-        printf(" - %s:%d\n", network[i]->ip, network[i]->port);
+        ts_print(" - %s:%d\n", network[i]->ip, network[i]->port);
     }
 
     return NULL;
@@ -307,7 +363,7 @@ void *server_thread()
         pthread_exit(NULL);
     }
 
-    printf(">> Server listening on %s:%d\n", my_address->ip, my_address->port);
+    ts_print(">> Server listening on %s:%d\n", my_address->ip, my_address->port);
 
     while (1)
     {
@@ -349,16 +405,8 @@ int main(int argc, char **argv)
     memcpy(my_address->ip, argv[1], strlen(argv[1]));
     my_address->port = atoi(argv[2]);
 
-    if (!is_valid_ip(my_address->ip))
+    if (!error_helper(my_address->ip, my_address->port))
     {
-        fprintf(stderr, ">> Invalid peer IP: %s\n", my_address->ip);
-        exit(EXIT_FAILURE);
-    }
-
-    if (!is_valid_port(my_address->port))
-    {
-        fprintf(stderr, ">> Invalid peer port: %d\n",
-                my_address->port);
         exit(EXIT_FAILURE);
     }
 
@@ -389,9 +437,9 @@ int main(int argc, char **argv)
     // Check
     for (int i = 0; i < SHA256_HASH_SIZE; i++)
     {
-        printf("%02x", my_address->signature[i]);
+        ts_print("%02x", my_address->signature[i]);
     }
-    printf("\n");
+    ts_print("\n");
 
     // Setup the client and server threads
     pthread_t client_thread_id;
@@ -402,6 +450,8 @@ int main(int argc, char **argv)
     // Wait for them to complete.
     pthread_join(client_thread_id, NULL);
     pthread_join(server_thread_id, NULL);
+
+    free_network();
 
     exit(EXIT_SUCCESS);
 }
