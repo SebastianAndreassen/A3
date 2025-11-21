@@ -297,8 +297,8 @@ int send_message(NetworkAddress_t *peer, int command, void *body, size_t body_le
         return 0;
     }
 
-    // ----- GET_FILE / RETREIVE reply -----
-    if (command == COMMAND_GET_FILE || command == COMMAND_RETREIVE)
+    // ----- RETREIVE reply -----
+    if (command == COMMAND_RETREIVE)
     {
         char local_name[FILENAME_MAX];
         memset(local_name, 0, sizeof(local_name));
@@ -319,6 +319,7 @@ int send_message(NetworkAddress_t *peer, int command, void *body, size_t body_le
         compsys_helper_readinitb(&rio, sock);
 
         uint32_t total_bytes = 0;
+        uint8_t expected_total_hash[SHA256_HASH_SIZE];
 
         while (1)
         {
@@ -334,10 +335,30 @@ int send_message(NetworkAddress_t *peer, int command, void *body, size_t body_le
             uint32_t block_len = ntohl(reply.length);
             uint32_t status = ntohl(reply.status);
             uint32_t block_num = ntohl(reply.this_block);
+            uint32_t total_blocks= ntohl(reply.block_count);
+
+            uint8_t block_hash[SHA256_HASH_SIZE];
+            uint8_t total_hash[SHA256_HASH_SIZE];
+
+            memcpy(block_hash, reply.block_hash, SHA256_HASH_SIZE);
+            memcpy(total_hash, reply.total_hash, SHA256_HASH_SIZE);
 
             if (status == STATUS_DONE)
             {
                 ts_print("File transfer complete. Total bytes=%u\n", total_bytes);
+                
+                uint8_t file_hash[SHA256_HASH_SIZE];
+                fseek(fp, 0, SEEK_SET);
+                char *file_buf = malloc(total_bytes);
+                if (file_buf)
+                {
+                    fread(file_buf, 1, total_bytes, fp);
+                    get_data_sha(file_buf, file_hash, total_bytes, SHA256_HASH_SIZE);
+                    if (memcmp(file_hash, total_hash, SHA256_HASH_SIZE) != 0)
+                        fprintf(stderr, "WARNING: Total file hash mismatch!\n");
+                    free(file_buf);
+                }
+                
                 fclose(fp);
                 close(sock);
                 return 0;
@@ -366,6 +387,13 @@ int send_message(NetworkAddress_t *peer, int command, void *body, size_t body_le
                 fclose(fp);
                 close(sock);
                 return -1;
+            }
+            
+            uint8_t block_hash_check[SHA256_HASH_SIZE];
+            get_data_sha(buffer, block_hash_check, block_len, SHA256_HASH_SIZE);
+            if (memcmp(block_hash_check, block_hash, SHA256_HASH_SIZE) != 0)
+            {
+                fprintf(stderr, "WARNING: Block %u hash mismatch!\n", block_num);
             }
 
             fwrite(buffer, 1, block_len, fp);
@@ -585,17 +613,34 @@ void *handle_server_request_thread(void *arg)
             return NULL;
         }
 
+        // Calculate file size and block count
+        fseek(fp, 0, SEEK_END);
+        long filesize = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        uint32_t total_blocks = (filesize + FILE_BLOCK_SIZE - 1) / FILE_BLOCK_SIZE;
+
+        // Compute total file hash
+        uint8_t total_hash[SHA256_HASH_SIZE];
+        get_file_sha(filename, total_hash, SHA256_HASH_SIZE);
+
         char buffer[FILE_BLOCK_SIZE];
         uint32_t block_number = 0;
         size_t bytes_read;
 
         while ((bytes_read = fread(buffer, 1, FILE_BLOCK_SIZE, fp)) > 0)
         {
-            ReplyHeader_t reply = {
-                .length = htonl((uint32_t)bytes_read),
-                .status = htonl(STATUS_OK),
-                .this_block = htonl(block_number)
-            };
+            uint8_t block_hash[SHA256_HASH_SIZE];
+            get_data_sha(buffer, block_hash, bytes_read, SHA256_HASH_SIZE);
+
+            ReplyHeader_t reply;
+            memset(&reply, 0, sizeof(reply));
+            reply.length      = htonl((uint32_t)bytes_read);
+            reply.status      = htonl(STATUS_OK);
+            reply.this_block  = htonl(block_number);
+            reply.block_count = htonl(total_blocks);
+            memcpy(reply.block_hash, block_hash, SHA256_HASH_SIZE);
+            memcpy(reply.total_hash, total_hash, SHA256_HASH_SIZE);
+
             compsys_helper_writen(connfd, &reply, sizeof(reply));
             compsys_helper_writen(connfd, buffer, bytes_read);
             block_number++;
