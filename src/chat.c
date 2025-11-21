@@ -24,7 +24,8 @@ NetworkAddress_t **network = NULL;
 uint32_t peer_count = 0;
 
 pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t print_mutex  = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 void ts_print(const char *fmt, ...) {
     pthread_mutex_lock(&print_mutex);
@@ -38,6 +39,7 @@ void ts_print(const char *fmt, ...) {
 
     pthread_mutex_unlock(&print_mutex);
 }
+
 
 void free_network()
 {
@@ -64,41 +66,6 @@ int error_helper(char *ip, int port)
     }
 
     return 1;
-}
-
-// Return a random peer that is not 'self'.
-// Returns NULL if there are no other peers.
-NetworkAddress_t *get_random_peer(const NetworkAddress_t *self)
-{
-    pthread_mutex_lock(&network_mutex);
-
-    if (peer_count <= 1) {
-        pthread_mutex_unlock(&network_mutex);
-        return NULL;
-    }
-
-    NetworkAddress_t *eligible[peer_count - 1];
-    uint32_t eligible_count = 0;
-
-    for (uint32_t i = 0; i < peer_count; i++)
-    {
-        NetworkAddress_t *p = network[i];
-        if (strcmp(p->ip, self->ip) != 0 || p->port != self->port)
-        {
-            eligible[eligible_count++] = p;
-        }
-    }
-
-    if (eligible_count == 0) {
-        pthread_mutex_unlock(&network_mutex);
-        return NULL;
-    }
-
-    uint32_t index = rand() % eligible_count;
-    NetworkAddress_t *chosen = eligible[index];
-
-    pthread_mutex_unlock(&network_mutex);
-    return chosen;
 }
 
 // Adds candidate to network only if it's not already present.
@@ -152,21 +119,17 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
     compsys_helper_writen(sock, &req, sizeof(RequestHeader_t));
 
     // Send body if present
-    if (body_len > 0 && body != NULL)
+    if (body_len > 0)
     {
         compsys_helper_writen(sock, body, body_len);
     }
 
-    // Handle REGISTER reply
+    // Only wait for reply if this is REGISTER
     if (command == COMMAND_REGISTER)
     {
         // ===== Receive reply header =====
         uint8_t reply_header[REPLY_HEADER_LEN];
-        if (compsys_helper_readn(sock, reply_header, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
-            ts_print("Failed to read REGISTER reply header\n");
-            close(sock);
-            return;
-        }
+        compsys_helper_readn(sock, reply_header, REPLY_HEADER_LEN);
 
         uint32_t reply_length = ntohl(*(uint32_t *)&reply_header[0]);
         uint32_t reply_status = ntohl(*(uint32_t *)&reply_header[4]);
@@ -180,18 +143,7 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
 
         // ===== Read reply body =====
         char *reply_body = malloc(reply_length);
-        if (!reply_body) {
-            perror("malloc");
-            close(sock);
-            return;
-        }
-
-        if (compsys_helper_readn(sock, reply_body, reply_length) != reply_length) {
-            ts_print("Failed to read REGISTER reply body\n");
-            free(reply_body);
-            close(sock);
-            return;
-        }
+        compsys_helper_readn(sock, reply_body, reply_length);
 
         // reply_body contains peers in blocks of sizeof(NetworkAddress_t)
         int peers_in_msg = reply_length / sizeof(NetworkAddress_t);
@@ -202,60 +154,6 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
         }
 
         free(reply_body);
-    }
-    // Handle RETREIVE (file download) reply
-    else if (command == COMMAND_RETREIVE)
-    {
-        ReplyHeader_t reply;
-        if (compsys_helper_readn(sock, &reply, sizeof(reply)) != sizeof(reply)) {
-            ts_print("Failed to read RETREIVE reply header\n");
-            close(sock);
-            return;
-        }
-
-        uint32_t file_length = ntohl(reply.length);
-        uint32_t status      = ntohl(reply.status);
-
-        if (status != STATUS_OK) {
-            ts_print("File request failed (status=%u)\n", status);
-            close(sock);
-            return;
-        }
-
-        char *file_buffer = malloc(file_length);
-        if (!file_buffer) {
-            perror("malloc");
-            close(sock);
-            return;
-        }
-
-        if (compsys_helper_readn(sock, file_buffer, file_length) != file_length) {
-            ts_print("Failed to read file data\n");
-            free(file_buffer);
-            close(sock);
-            return;
-        }
-
-        // Save file locally using body as filename
-        char local_name[FILENAME_MAX];
-        memset(local_name, 0, sizeof(local_name));
-        if (body_len >= FILENAME_MAX) body_len = FILENAME_MAX - 1;
-        memcpy(local_name, (const char *)body, body_len);
-        local_name[body_len] = '\0';
-
-        FILE *fp = fopen(local_name, "wb");
-        if (!fp) {
-            perror("fopen");
-            free(file_buffer);
-            close(sock);
-            return;
-        }
-
-        fwrite(file_buffer, 1, file_length, fp);
-        fclose(fp);
-        free(file_buffer);
-
-        ts_print("Downloaded '%s' (%u bytes)\n", local_name, file_length);
     }
 
     // Close socket in all cases
@@ -283,6 +181,7 @@ void inform_all_other_peers(NetworkAddress_t *new_peer)
     }
 }
 
+
 void *handle_server_request_thread(void *arg)
 {
     pthread_detach(pthread_self());
@@ -300,22 +199,17 @@ void *handle_server_request_thread(void *arg)
     }
 
     // Convert network byte order
-    uint32_t command  = ntohl(req.command);
+    uint32_t command = ntohl(req.command);
     uint32_t body_len = ntohl(req.length);
-    uint32_t port     = ntohl(req.port);
+    uint32_t port = ntohl(req.port);
 
     ts_print(">> [Server] Received command=%u length=%u from %s:%u\n",
-             command, body_len, req.ip, port);
+           command, body_len, req.ip, port);
 
-    // ===== INFORM =====
     if (command == COMMAND_INFORM)
     {
         NetworkAddress_t new_peer;
-        if (compsys_helper_readn(connfd, &new_peer, sizeof(NetworkAddress_t)) != sizeof(NetworkAddress_t)) {
-            fprintf(stderr, ">> [Server] Failed to read INFORM body\n");
-            close(connfd);
-            return NULL;
-        }
+        compsys_helper_readn(connfd, &new_peer, sizeof(NetworkAddress_t));
 
         add_to_network_if_missing(&new_peer);
 
@@ -330,96 +224,17 @@ void *handle_server_request_thread(void *arg)
         return NULL;
     }
 
-    // ===== RETREIVE (GET_FILE) =====
-    if (command == COMMAND_RETREIVE)
-    {
-        if (body_len == 0 || body_len >= FILENAME_MAX) {
-            fprintf(stderr, ">> [Server] Invalid filename length %u\n", body_len);
-            close(connfd);
-            return NULL;
-        }
-
-        char filename[FILENAME_MAX];
-        memset(filename, 0, sizeof(filename));
-
-        if (compsys_helper_readn(connfd, filename, body_len) != (int)body_len) {
-            fprintf(stderr, ">> [Server] Failed to read filename\n");
-            close(connfd);
-            return NULL;
-        }
-
-        filename[body_len] = '\0';
-        filename[strcspn(filename, "\r\n")] = '\0';
-
-        // Strip leading slashes
-        while (filename[0] == '/') {
-            memmove(filename, filename + 1, strlen(filename));
-        }
-
-        ts_print(">> [Server] Client requested file: '%s'\n", filename);
-
-        FILE *fp = fopen(filename, "rb");
-        if (!fp) {
-            ts_print(">> [Server] File not found: '%s'\n", filename);
-            ReplyHeader_t reply = {
-                .length     = htonl(0),
-                .status     = htonl(STATUS_OTHER),
-                .this_block = htonl(0)
-            };
-            compsys_helper_writen(connfd, &reply, sizeof(reply));
-            close(connfd);
-            return NULL;
-        }
-
-        fseek(fp, 0, SEEK_END);
-        long filesize = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-
-        ReplyHeader_t reply = {
-            .length     = htonl((uint32_t)filesize),
-            .status     = htonl(STATUS_OK),
-            .this_block = htonl(0)
-        };
-        compsys_helper_writen(connfd, &reply, sizeof(reply));
-
-        char *file_buffer = malloc((size_t)filesize);
-        if (!file_buffer) {
-            perror("malloc");
-            fclose(fp);
-            close(connfd);
-            return NULL;
-        }
-
-        if (fread(file_buffer, 1, (size_t)filesize, fp) != (size_t)filesize) {
-            fprintf(stderr, ">> [Server] Failed to read file data\n");
-            free(file_buffer);
-            fclose(fp);
-            close(connfd);
-            return NULL;
-        }
-        fclose(fp);
-
-        if (compsys_helper_writen(connfd, file_buffer, (size_t)filesize) != (ssize_t)filesize) {
-            fprintf(stderr, ">> [Server] Failed to send file data\n");
-        }
-
-        free(file_buffer);
-        ts_print(">> [Server] Sent file '%s' (%ld bytes)\n", filename, filesize);
-
-        close(connfd);
-        return NULL;
-    }
-
-    // ===== REGISTER =====
+    // ===== 2. Handle REGISTER command =====
     if (command == COMMAND_REGISTER)
     {
+
         // --- Validation ---
         if (!error_helper(req.ip, port))
         {
             ts_print(">> [Server] Invalid IP/port in register request.\n");
             ReplyHeader_t reply = {
-                .length     = htonl(0),
-                .status     = htonl(STATUS_MALFORMED),
+                .length = htonl(0),
+                .status = htonl(STATUS_MALFORMED),
                 .this_block = htonl(0)};
 
             compsys_helper_writen(connfd, &reply, sizeof(reply));
@@ -453,8 +268,8 @@ void *handle_server_request_thread(void *arg)
 
         // ===== 4. Send reply header + body =====
         ReplyHeader_t reply = {
-            .length     = htonl(body_size),
-            .status     = htonl(STATUS_OK),
+            .length = htonl(body_size),
+            .status = htonl(STATUS_OK),
             .this_block = htonl(0)};
 
         compsys_helper_writen(connfd, &reply, sizeof(ReplyHeader_t));
@@ -498,7 +313,7 @@ void *client_thread()
     fprintf(stdout, "Enter peer IP to connect to: ");
     scanf("%16s", peer_ip);
 
-    // Clean up IP string
+    // Clean up password string as otherwise some extra chars can sneak in.
     for (int i = strlen(peer_ip); i < IP_LEN; i++)
     {
         peer_ip[i] = '\0';
@@ -508,15 +323,11 @@ void *client_thread()
     fprintf(stdout, "Enter peer port to connect to: ");
     scanf("%16s", peer_port);
 
-    // Clean up port string
+    // Clean up password string as otherwise some extra chars can sneak in.
     for (int i = strlen(peer_port); i < PORT_STR_LEN; i++)
     {
         peer_port[i] = '\0';
     }
-
-    // Flush leftover newline so fgets works later
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF) { }
 
     NetworkAddress_t peer_address;
     memset(&peer_address, 0, sizeof(peer_address));
@@ -525,47 +336,11 @@ void *client_thread()
 
     // Send REGISTER request
     send_message(&peer_address, COMMAND_REGISTER, NULL, 0);
-
     // Print network list after registration
     ts_print("\nKnown peers after registration:\n");
-    pthread_mutex_lock(&network_mutex);
     for (uint32_t i = 0; i < peer_count; i++)
     {
         ts_print(" - %s:%d\n", network[i]->ip, network[i]->port);
-    }
-    pthread_mutex_unlock(&network_mutex);
-
-    // === 2.4: file request loop ===
-    char filename[FILENAME_MAX];
-
-    while (1)
-    {
-        ts_print("Please enter a file name: ");
-        fflush(stdout);
-
-        if (!fgets(filename, sizeof(filename), stdin)) {
-            fprintf(stderr, "Error reading input.\n");
-            continue;
-        }
-
-        filename[strcspn(filename, "\r\n")] = '\0';  // trim newline
-
-        if (strlen(filename) == 0)
-            continue;
-
-        ts_print("Requesting file: '%s'\n", filename);
-
-        size_t filename_len = strlen(filename);
-        if (filename_len == 0)
-            continue;
-
-        NetworkAddress_t *target = get_random_peer(my_address);
-        if (target == NULL) {
-            fprintf(stderr, ">> [Client] No available peers to request file from\n");
-            continue;
-        }
-
-        send_message(target, COMMAND_RETREIVE, filename, (int)filename_len);
     }
 
     return NULL;
@@ -645,10 +420,6 @@ int main(int argc, char **argv)
         password[i] = '\0';
     }
 
-    // Eat leftover newline before client_thread uses fgets
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF) { }
-
     // Most correctly, we should randomly generate our salts, but this can make
     // repeated testing difficult so feel free to use the hard coded salt below
     char salt[SALT_LEN + 1] = "0123456789ABCDEF\0";
@@ -669,8 +440,6 @@ int main(int argc, char **argv)
         ts_print("%02x", my_address->signature[i]);
     }
     ts_print("\n");
-
-    srand((unsigned int)time(NULL)); // for get_random_peer
 
     // Setup the client and server threads
     pthread_t client_thread_id;
