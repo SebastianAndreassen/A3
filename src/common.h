@@ -17,6 +17,7 @@
 #define COMMAND_REGISTER        1
 #define COMMAND_RETREIVE        2
 #define COMMAND_INFORM          3
+#define COMMAND_GET_FILE        4
 
 #define STATUS_OK               1
 #define STATUS_PEER_EXISTS      2
@@ -25,6 +26,9 @@
 #define STATUS_BAD_REQUEST      5
 #define STATUS_OTHER            6
 #define STATUS_MALFORMED        7
+#define STATUS_FILE_NOT_FOUND   8
+#define STATUS_DONE             9
+
 
 #define IP_LEN                  16
 #define PORT_LEN                4
@@ -33,6 +37,9 @@
 #define REQUEST_HEADER_LEN      60
 #define REPLY_HEADER_LEN        80 
 #define PEER_ADDR_LEN           68
+
+
+#define FILE_BLOCK_SIZE         4096
 
 #define MAX_MSG_LEN             8196
 
