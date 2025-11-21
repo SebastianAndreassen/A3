@@ -622,10 +622,9 @@ void *handle_server_request_thread(void *arg)
 // ---------------------------
 // Client thread
 // ---------------------------
-void *client_thread(void *unused)
+void *client_thread()
 {
-    (void)unused;
-
+    
     while (1)
     {
         char peer_ip[IP_LEN];
@@ -660,38 +659,44 @@ void *client_thread(void *unused)
             printf("connection failed\n");
             continue;
         }
-
         printf("\nKnown peers after registration:\n");
-        pthread_mutex_lock(&network_mutex);
-        for (uint32_t i = 0; i < peer_count; i++)
-            printf(" - %s:%d\n", network[i]->ip, network[i]->port);
-        pthread_mutex_unlock(&network_mutex);
+            pthread_mutex_lock(&network_mutex);
+            for (uint32_t i = 0; i < peer_count; i++)
+                printf(" - %s:%d\n", network[i]->ip, network[i]->port);
+            pthread_mutex_unlock(&network_mutex);
 
-        char filename[FILENAME_MAX];
-        printf("Please enter a file name: ");
-        fflush(stdout);
-        if (!fgets(filename, sizeof(filename), stdin))
+        while(1)
         {
-            fprintf(stderr, "Error reading input.\n");
-            continue;
+            
+            char filename[FILENAME_MAX];
+            printf("Please enter a file name: ");
+            fflush(stdout);
+            if (!fgets(filename, sizeof(filename), stdin))
+            {
+                fprintf(stderr, "Error reading input.\n");
+                continue;
+            }
+            filename[strcspn(filename, "\r\n")] = '\0';
+
+            if (strlen(filename) == 0) continue;
+
+            printf("Requesting file: '%s'\n", filename);
+
+            size_t filename_len = strlen(filename);
+
+            NetworkAddress_t *target = get_random_peer(my_address);
+            if (target == NULL)
+            {
+                fprintf(stderr, ">> [Client] No available peers to request file from\n");
+            }
+
+            if(send_message(target, COMMAND_RETREIVE, filename, filename_len)!=0){
+                printf("Transfer failed, try agian\n");
+                continue;
+            }
         }
-        filename[strcspn(filename, "\r\n")] = '\0';
-
-        if (strlen(filename) == 0) continue;
-
-        printf("Requesting file: '%s'\n", filename);
-
-        size_t filename_len = strlen(filename);
-
-        NetworkAddress_t *target = get_random_peer(my_address);
-        if (target == NULL)
-        {
-            fprintf(stderr, ">> [Client] No available peers to request file from\n");
-            continue;
-        }
-
-        send_message(target, COMMAND_GET_FILE, filename, filename_len);
     }
+        
 
     return NULL;
 }
