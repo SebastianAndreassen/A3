@@ -24,9 +24,62 @@ NetworkAddress_t **network = NULL;
 uint32_t peer_count = 0;
 
 pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t print_mutex  = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void ts_print(const char *fmt, ...) {
+void get_signature(void *password, int password_len, char *salt, hashdata_t *out_hash)
+{
+    int combined_len = password_len + SALT_LEN;
+    char *buf = malloc(combined_len);
+    if (!buf)
+    {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+    memcpy(buf, password, password_len);
+    memcpy(buf + password_len, salt, SALT_LEN);
+    get_data_sha(buf, *out_hash, (uint32_t)combined_len, SHA256_HASH_SIZE);
+    memset(buf, 0, combined_len);
+    free(buf);
+}
+
+void compute_final_signature(hashdata_t client_sig, char *salt, hashdata_t *out)
+{
+    get_signature(client_sig, SHA256_HASH_SIZE, salt, out);
+}
+
+/*
+ * SINGLE helper used everywhere:
+ * - checks if peer exists
+ * - adds if missing
+ * - returns pointer either way
+ * - tells caller whether it was added
+ */
+NetworkAddress_t *get_or_add_peer(const NetworkAddress_t *candidate, int *added)
+{
+    pthread_mutex_lock(&network_mutex);
+
+    for (uint32_t i = 0; i < peer_count; i++)
+    {
+        if (strcmp(network[i]->ip, candidate->ip) == 0 &&
+            network[i]->port == candidate->port)
+        {
+            if (added) *added = 0;
+            pthread_mutex_unlock(&network_mutex);
+            return network[i];
+        }
+    }
+
+    NetworkAddress_t *new_peer = malloc(sizeof(NetworkAddress_t));
+    memcpy(new_peer, candidate, sizeof(NetworkAddress_t));
+    network[peer_count++] = new_peer;
+
+    if (added) *added = 1;
+    pthread_mutex_unlock(&network_mutex);
+    return new_peer;
+}
+
+void ts_print(const char *fmt, ...)
+{
     pthread_mutex_lock(&print_mutex);
 
     va_list args;
@@ -34,7 +87,7 @@ void ts_print(const char *fmt, ...) {
     vfprintf(stdout, fmt, args);
     va_end(args);
 
-    fflush(stdout);  // ensure ordered output
+    fflush(stdout); // ensure ordered output
 
     pthread_mutex_unlock(&print_mutex);
 }
@@ -72,7 +125,8 @@ NetworkAddress_t *get_random_peer(const NetworkAddress_t *self)
 {
     pthread_mutex_lock(&network_mutex);
 
-    if (peer_count <= 1) {
+    if (peer_count <= 1)
+    {
         pthread_mutex_unlock(&network_mutex);
         return NULL;
     }
@@ -89,7 +143,8 @@ NetworkAddress_t *get_random_peer(const NetworkAddress_t *self)
         }
     }
 
-    if (eligible_count == 0) {
+    if (eligible_count == 0)
+    {
         pthread_mutex_unlock(&network_mutex);
         return NULL;
     }
@@ -99,32 +154,6 @@ NetworkAddress_t *get_random_peer(const NetworkAddress_t *self)
 
     pthread_mutex_unlock(&network_mutex);
     return chosen;
-}
-
-// Adds candidate to network only if it's not already present.
-// Returns 1 if added, 0 if it already existed.
-int add_to_network_if_missing(const NetworkAddress_t *candidate)
-{
-    pthread_mutex_lock(&network_mutex);
-
-    // Check for duplicates
-    for (uint32_t i = 0; i < peer_count; i++)
-    {
-        if (strcmp(network[i]->ip, candidate->ip) == 0 &&
-            network[i]->port == candidate->port)
-        {
-            pthread_mutex_unlock(&network_mutex);
-            return 0; // already present
-        }
-    }
-
-    // Add entry
-    NetworkAddress_t *new_peer = malloc(sizeof(NetworkAddress_t));
-    memcpy(new_peer, candidate, sizeof(NetworkAddress_t));
-    network[peer_count++] = new_peer;
-    pthread_mutex_unlock(&network_mutex);
-
-    return 1;
 }
 
 void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
@@ -162,7 +191,8 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
     {
         // ===== Receive reply header =====
         uint8_t reply_header[REPLY_HEADER_LEN];
-        if (compsys_helper_readn(sock, reply_header, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
+        if (compsys_helper_readn(sock, reply_header, REPLY_HEADER_LEN) != REPLY_HEADER_LEN)
+        {
             ts_print("Failed to read REGISTER reply header\n");
             close(sock);
             return;
@@ -180,13 +210,15 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
 
         // ===== Read reply body =====
         char *reply_body = malloc(reply_length);
-        if (!reply_body) {
+        if (!reply_body)
+        {
             perror("malloc");
             close(sock);
             return;
         }
 
-        if (compsys_helper_readn(sock, reply_body, reply_length) != reply_length) {
+        if (compsys_helper_readn(sock, reply_body, reply_length) != reply_length)
+        {
             ts_print("Failed to read REGISTER reply body\n");
             free(reply_body);
             close(sock);
@@ -197,8 +229,10 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
         int peers_in_msg = reply_length / sizeof(NetworkAddress_t);
         for (int i = 0; i < peers_in_msg; i++)
         {
-            NetworkAddress_t *candidate = (NetworkAddress_t *)(reply_body + i * sizeof(NetworkAddress_t));
-            add_to_network_if_missing(candidate);
+            NetworkAddress_t *candidate =
+                (NetworkAddress_t *)(reply_body + i * sizeof(NetworkAddress_t));
+            int added;
+            get_or_add_peer(candidate, &added); // unified helper
         }
 
         free(reply_body);
@@ -207,29 +241,33 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
     else if (command == COMMAND_RETREIVE)
     {
         ReplyHeader_t reply;
-        if (compsys_helper_readn(sock, &reply, sizeof(reply)) != sizeof(reply)) {
+        if (compsys_helper_readn(sock, &reply, sizeof(reply)) != sizeof(reply))
+        {
             ts_print("Failed to read RETREIVE reply header\n");
             close(sock);
             return;
         }
 
         uint32_t file_length = ntohl(reply.length);
-        uint32_t status      = ntohl(reply.status);
+        uint32_t status = ntohl(reply.status);
 
-        if (status != STATUS_OK) {
+        if (status != STATUS_OK)
+        {
             ts_print("File request failed (status=%u)\n", status);
             close(sock);
             return;
         }
 
         char *file_buffer = malloc(file_length);
-        if (!file_buffer) {
+        if (!file_buffer)
+        {
             perror("malloc");
             close(sock);
             return;
         }
 
-        if (compsys_helper_readn(sock, file_buffer, file_length) != file_length) {
+        if (compsys_helper_readn(sock, file_buffer, file_length) != file_length)
+        {
             ts_print("Failed to read file data\n");
             free(file_buffer);
             close(sock);
@@ -239,12 +277,14 @@ void send_message(NetworkAddress_t *peer, int command, void *body, int body_len)
         // Save file locally using body as filename
         char local_name[FILENAME_MAX];
         memset(local_name, 0, sizeof(local_name));
-        if (body_len >= FILENAME_MAX) body_len = FILENAME_MAX - 1;
+        if (body_len >= FILENAME_MAX)
+            body_len = FILENAME_MAX - 1;
         memcpy(local_name, (const char *)body, body_len);
         local_name[body_len] = '\0';
 
         FILE *fp = fopen(local_name, "wb");
-        if (!fp) {
+        if (!fp)
+        {
             perror("fopen");
             free(file_buffer);
             close(sock);
@@ -268,7 +308,8 @@ void inform_all_other_peers(NetworkAddress_t *new_peer)
     uint32_t local_count = 0;
 
     pthread_mutex_lock(&network_mutex);
-    for (uint32_t i = 0; i < peer_count; i++) {
+    for (uint32_t i = 0; i < peer_count; i++)
+    {
         NetworkAddress_t *p = network[i];
         if (p != my_address &&
             !(strcmp(p->ip, new_peer->ip) == 0 && p->port == new_peer->port))
@@ -278,7 +319,8 @@ void inform_all_other_peers(NetworkAddress_t *new_peer)
     }
     pthread_mutex_unlock(&network_mutex);
 
-    for (uint32_t i = 0; i < local_count; i++) {
+    for (uint32_t i = 0; i < local_count; i++)
+    {
         send_message(local_copy[i], COMMAND_INFORM, new_peer, sizeof(NetworkAddress_t));
     }
 }
@@ -300,9 +342,9 @@ void *handle_server_request_thread(void *arg)
     }
 
     // Convert network byte order
-    uint32_t command  = ntohl(req.command);
+    uint32_t command = ntohl(req.command);
     uint32_t body_len = ntohl(req.length);
-    uint32_t port     = ntohl(req.port);
+    uint32_t port = ntohl(req.port);
 
     ts_print(">> [Server] Received command=%u length=%u from %s:%u\n",
              command, body_len, req.ip, port);
@@ -311,13 +353,15 @@ void *handle_server_request_thread(void *arg)
     if (command == COMMAND_INFORM)
     {
         NetworkAddress_t new_peer;
-        if (compsys_helper_readn(connfd, &new_peer, sizeof(NetworkAddress_t)) != sizeof(NetworkAddress_t)) {
+        if (compsys_helper_readn(connfd, &new_peer, sizeof(NetworkAddress_t)) != sizeof(NetworkAddress_t))
+        {
             fprintf(stderr, ">> [Server] Failed to read INFORM body\n");
             close(connfd);
             return NULL;
         }
 
-        add_to_network_if_missing(&new_peer);
+        int added;
+        get_or_add_peer(&new_peer, &added); // unified helper
 
         ts_print("Server list is now:\n");
         pthread_mutex_lock(&network_mutex);
@@ -333,7 +377,8 @@ void *handle_server_request_thread(void *arg)
     // ===== RETREIVE (GET_FILE) =====
     if (command == COMMAND_RETREIVE)
     {
-        if (body_len == 0 || body_len >= FILENAME_MAX) {
+        if (body_len == 0 || body_len >= FILENAME_MAX)
+        {
             fprintf(stderr, ">> [Server] Invalid filename length %u\n", body_len);
             close(connfd);
             return NULL;
@@ -342,7 +387,8 @@ void *handle_server_request_thread(void *arg)
         char filename[FILENAME_MAX];
         memset(filename, 0, sizeof(filename));
 
-        if (compsys_helper_readn(connfd, filename, body_len) != (int)body_len) {
+        if (compsys_helper_readn(connfd, filename, body_len) != (int)body_len)
+        {
             fprintf(stderr, ">> [Server] Failed to read filename\n");
             close(connfd);
             return NULL;
@@ -352,20 +398,21 @@ void *handle_server_request_thread(void *arg)
         filename[strcspn(filename, "\r\n")] = '\0';
 
         // Strip leading slashes
-        while (filename[0] == '/') {
+        while (filename[0] == '/')
+        {
             memmove(filename, filename + 1, strlen(filename));
         }
 
         ts_print(">> [Server] Client requested file: '%s'\n", filename);
 
         FILE *fp = fopen(filename, "rb");
-        if (!fp) {
+        if (!fp)
+        {
             ts_print(">> [Server] File not found: '%s'\n", filename);
             ReplyHeader_t reply = {
-                .length     = htonl(0),
-                .status     = htonl(STATUS_OTHER),
-                .this_block = htonl(0)
-            };
+                .length = htonl(0),
+                .status = htonl(STATUS_OTHER),
+                .this_block = htonl(0)};
             compsys_helper_writen(connfd, &reply, sizeof(reply));
             close(connfd);
             return NULL;
@@ -376,21 +423,22 @@ void *handle_server_request_thread(void *arg)
         fseek(fp, 0, SEEK_SET);
 
         ReplyHeader_t reply = {
-            .length     = htonl((uint32_t)filesize),
-            .status     = htonl(STATUS_OK),
-            .this_block = htonl(0)
-        };
+            .length = htonl((uint32_t)filesize),
+            .status = htonl(STATUS_OK),
+            .this_block = htonl(0)};
         compsys_helper_writen(connfd, &reply, sizeof(reply));
 
         char *file_buffer = malloc((size_t)filesize);
-        if (!file_buffer) {
+        if (!file_buffer)
+        {
             perror("malloc");
             fclose(fp);
             close(connfd);
             return NULL;
         }
 
-        if (fread(file_buffer, 1, (size_t)filesize, fp) != (size_t)filesize) {
+        if (fread(file_buffer, 1, (size_t)filesize, fp) != (size_t)filesize)
+        {
             fprintf(stderr, ">> [Server] Failed to read file data\n");
             free(file_buffer);
             fclose(fp);
@@ -399,7 +447,8 @@ void *handle_server_request_thread(void *arg)
         }
         fclose(fp);
 
-        if (compsys_helper_writen(connfd, file_buffer, (size_t)filesize) != (ssize_t)filesize) {
+        if (compsys_helper_writen(connfd, file_buffer, (size_t)filesize) != (ssize_t)filesize)
+        {
             fprintf(stderr, ">> [Server] Failed to send file data\n");
         }
 
@@ -418,8 +467,8 @@ void *handle_server_request_thread(void *arg)
         {
             ts_print(">> [Server] Invalid IP/port in register request.\n");
             ReplyHeader_t reply = {
-                .length     = htonl(0),
-                .status     = htonl(STATUS_MALFORMED),
+                .length = htonl(0),
+                .status = htonl(STATUS_MALFORMED),
                 .this_block = htonl(0)};
 
             compsys_helper_writen(connfd, &reply, sizeof(reply));
@@ -427,19 +476,40 @@ void *handle_server_request_thread(void *arg)
             return NULL;
         }
 
-        // --- Check if already exists ---
+        // Build candidate from request
         NetworkAddress_t candidate;
         memcpy(candidate.ip, req.ip, IP_LEN);
         candidate.port = port;
 
-        if (add_to_network_if_missing(&candidate))
-        {
-            // Only compute salt/signature when truly added
-            NetworkAddress_t *added = network[peer_count - 1];
-            generate_random_salt(added->salt);
-            get_signature(req.signature, SHA256_HASH_SIZE, added->salt, &added->signature);
+        // UNIFIED find-or-add
+        int added_flag;
+        NetworkAddress_t *peer = get_or_add_peer(&candidate, &added_flag);
 
-            inform_all_other_peers(added);
+        if (added_flag)
+        {
+            // NEW PEER → generate server-side salt + final signature
+            generate_random_salt(peer->salt);
+            get_signature(req.signature, SHA256_HASH_SIZE,
+                          peer->salt, &peer->signature);
+
+            inform_all_other_peers(peer);
+        }
+        else
+        {
+            // RETURNING PEER → verify password correctness
+            hashdata_t test_final;
+            compute_final_signature(req.signature, peer->salt, &test_final);
+
+            if (memcmp(test_final, peer->signature, SHA256_HASH_SIZE) != 0)
+            {
+                ReplyHeader_t reply = {
+                    .length = htonl(0),
+                    .status = htonl(STATUS_BAD_PASSWORD),
+                    .this_block = htonl(0)};
+                compsys_helper_writen(connfd, &reply, sizeof(reply));
+                close(connfd);
+                return NULL;
+            }
         }
 
         // ===== 3. Build reply body (all known peers) =====
@@ -453,8 +523,8 @@ void *handle_server_request_thread(void *arg)
 
         // ===== 4. Send reply header + body =====
         ReplyHeader_t reply = {
-            .length     = htonl(body_size),
-            .status     = htonl(STATUS_OK),
+            .length = htonl(body_size),
+            .status = htonl(STATUS_OK),
             .this_block = htonl(0)};
 
         compsys_helper_writen(connfd, &reply, sizeof(ReplyHeader_t));
@@ -465,22 +535,6 @@ void *handle_server_request_thread(void *arg)
 
     close(connfd);
     return NULL;
-}
-
-void get_signature(void *password, int password_len, char *salt, hashdata_t *out_hash)
-{
-    int combined_len = password_len + SALT_LEN;
-    char *buf = malloc(combined_len);
-    if (!buf)
-    {
-        perror("malloc");
-        exit(EXIT_FAILURE);
-    }
-    memcpy(buf, password, password_len);
-    memcpy(buf + password_len, salt, SALT_LEN);
-    get_data_sha(buf, *out_hash, (uint32_t)combined_len, SHA256_HASH_SIZE);
-    memset(buf, 0, combined_len);
-    free(buf);
 }
 
 /*
@@ -516,7 +570,9 @@ void *client_thread()
 
     // Flush leftover newline so fgets works later
     int c;
-    while ((c = getchar()) != '\n' && c != EOF) { }
+    while ((c = getchar()) != '\n' && c != EOF)
+    {
+    }
 
     NetworkAddress_t peer_address;
     memset(&peer_address, 0, sizeof(peer_address));
@@ -543,12 +599,13 @@ void *client_thread()
         ts_print("Please enter a file name: ");
         fflush(stdout);
 
-        if (!fgets(filename, sizeof(filename), stdin)) {
+        if (!fgets(filename, sizeof(filename), stdin))
+        {
             fprintf(stderr, "Error reading input.\n");
             continue;
         }
 
-        filename[strcspn(filename, "\r\n")] = '\0';  // trim newline
+        filename[strcspn(filename, "\r\n")] = '\0'; // trim newline
 
         if (strlen(filename) == 0)
             continue;
@@ -560,7 +617,8 @@ void *client_thread()
             continue;
 
         NetworkAddress_t *target = get_random_peer(my_address);
-        if (target == NULL) {
+        if (target == NULL)
+        {
             fprintf(stderr, ">> [Client] No available peers to request file from\n");
             continue;
         }
@@ -647,7 +705,9 @@ int main(int argc, char **argv)
 
     // Eat leftover newline before client_thread uses fgets
     int c;
-    while ((c = getchar()) != '\n' && c != EOF) { }
+    while ((c = getchar()) != '\n' && c != EOF)
+    {
+    }
 
     // Most correctly, we should randomly generate our salts, but this can make
     // repeated testing difficult so feel free to use the hard coded salt below
